@@ -16,6 +16,8 @@ import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.AttributeSet;
@@ -113,7 +115,6 @@ public class CustomCameraView extends RelativeLayout implements CameraXOrientati
     private VideoCapture<Recorder> mVideoCapture;
     private Recording activeRecording;
 
-    private int displayId = -1;
     /**
      * 相机模式
      */
@@ -198,6 +199,19 @@ public class CustomCameraView extends RelativeLayout implements CameraXOrientati
     private TextureView mTextureView;
     private DisplayManager displayManager;
     private DisplayListener displayListener;
+    private boolean displayListenerRegistered;
+    private boolean destroyed;
+    private final View.OnAttachStateChangeListener previewAttachListener = new View.OnAttachStateChangeListener() {
+        @Override
+        public void onViewAttachedToWindow(View view) {
+            startListeningToDisplayChanges();
+        }
+
+        @Override
+        public void onViewDetachedFromWindow(View view) {
+            stopListeningToDisplayChanges();
+        }
+    };
     private CameraXOrientationEventListener orientationEventListener;
     private CameraInfo mCameraInfo;
     private CameraControl mCameraControl;
@@ -241,20 +255,8 @@ public class CustomCameraView extends RelativeLayout implements CameraXOrientati
         mSwitchCamera.setImageResource(R.drawable.picture_ic_camera);
         displayManager = (DisplayManager) getContext().getSystemService(Context.DISPLAY_SERVICE);
         displayListener = new DisplayListener();
-        displayManager.registerDisplayListener(displayListener, null);
+        mCameraPreviewView.addOnAttachStateChangeListener(previewAttachListener);
         mainExecutor = ContextCompat.getMainExecutor(getContext());
-
-        mCameraPreviewView.post(new Runnable() {
-            @Override
-            public void run() {
-                if (mCameraPreviewView != null) {
-                    Display display = mCameraPreviewView.getDisplay();
-                    if (display != null) {
-                        displayId = display.getDisplayId();
-                    }
-                }
-            }
-        });
 
         mFlashLamp.setOnClickListener(v -> {
             typeFlash++;
@@ -641,6 +643,28 @@ public class CustomCameraView extends RelativeLayout implements CameraXOrientati
         }
     }
 
+    private void startListeningToDisplayChanges() {
+        if (destroyed || displayListenerRegistered || displayManager == null ||
+                mCameraPreviewView == null || !mCameraPreviewView.isAttachedToWindow()) {
+            return;
+        }
+        displayManager.registerDisplayListener(displayListener, new Handler(Looper.getMainLooper()));
+        displayListenerRegistered = true;
+        // A display may have rotated while the preview was detached.
+        Display display = mCameraPreviewView.getDisplay();
+        if (display != null) {
+            displayListener.onDisplayChanged(display.getDisplayId());
+        }
+    }
+
+    private void stopListeningToDisplayChanges() {
+        if (!displayListenerRegistered) {
+            return;
+        }
+        displayListenerRegistered = false;
+        displayManager.unregisterDisplayListener(displayListener);
+    }
+
     /**
      * We need a display listener for orientation changes that do not trigger a configuration
      * change, for example if we choose to override config change in manifest or for 180-degree
@@ -658,16 +682,24 @@ public class CustomCameraView extends RelativeLayout implements CameraXOrientati
 
         @Override
         public void onDisplayChanged(int displayId) {
-            if (displayId == CustomCameraView.this.displayId) {
-                if (mImageCapture != null) {
-                    mImageCapture.setTargetRotation(mCameraPreviewView.getDisplay().getRotation());
-                }
-                if (mImageAnalyzer != null) {
-                    mImageAnalyzer.setTargetRotation(mCameraPreviewView.getDisplay().getRotation());
-                }
-                if (mVideoCapture != null) {
-                    mVideoCapture.setTargetRotation(mCameraPreviewView.getDisplay().getRotation());
-                }
+            // Unregistration cannot be relied on to cancel callbacks already queued by the system.
+            if (destroyed || !displayListenerRegistered || mCameraPreviewView == null ||
+                    !mCameraPreviewView.isAttachedToWindow()) {
+                return;
+            }
+            Display display = mCameraPreviewView.getDisplay();
+            if (display == null || display.getDisplayId() != displayId) {
+                return;
+            }
+            int rotation = display.getRotation();
+            if (mImageCapture != null) {
+                mImageCapture.setTargetRotation(rotation);
+            }
+            if (mImageAnalyzer != null) {
+                mImageAnalyzer.setTargetRotation(rotation);
+            }
+            if (mVideoCapture != null) {
+                mVideoCapture.setTargetRotation(rotation);
             }
         }
     }
@@ -1223,8 +1255,10 @@ public class CustomCameraView extends RelativeLayout implements CameraXOrientati
      * onDestroy
      */
     public void onDestroy() {
+        destroyed = true;
+        mCameraPreviewView.removeOnAttachStateChangeListener(previewAttachListener);
+        stopListeningToDisplayChanges();
         stopVideoRecording();
-        displayManager.unregisterDisplayListener(displayListener);
         stopCheckOrientation();
         focusImageView.destroy();
     }
